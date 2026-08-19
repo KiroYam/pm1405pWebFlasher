@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="firmwarewebflasher.client/firmwarewebflasher.client.esproj">
+    <Build />
+    <Deploy />
+  </Project>
+  <Project Path="FirmwareWebFlasher.Server/FirmwareWebFlasher.Server.csproj" />
+</Solution>
