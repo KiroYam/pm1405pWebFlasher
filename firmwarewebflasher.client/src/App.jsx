@@ -8,13 +8,14 @@ export default function App() {
     const serial = useRef(new WebSerialPort());
     const firmware = useRef({ bytes: [], blocks: 0 });
     const indexRef = useRef(0);
+    const packetBufRef = useRef([]);
+
     const [log, setLog] = useState("");
     const [progress, setProgress] = useState("");
     const [devAddr, setDevAddr] = useState("01");
     const [portState, setPortState] = useState("closed");
     const [fileName, setFileName] = useState("");
 
-    // New refs/state for STATUS.BIN handling
     const statusFileHandleRef = useRef(null);
     const statusFileContentRef = useRef(null);
     const [statusFileName, setStatusFileName] = useState("");
@@ -61,16 +62,6 @@ export default function App() {
         }
     }
 
-    async function sendBytes(arr) {
-        try {
-            await serial.current.writeBytes(arr);
-            appendLog("Sent: " + Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join(" "));
-        } catch (e) {
-            appendLog("Send error: " + e);
-        }
-    }
-
-    // Modified buildFWPacket to follow provided C++ layout (0xAA, type 0x02, index, indexEnd-1, 2048 payload, CRC16)
     function buildFWPacket(index) {
         const size = firmware.current.bytes.length;
         const indexEnd = firmware.current.blocks || Math.ceil(size / 2048);
@@ -88,7 +79,6 @@ export default function App() {
             bufwr[k + 4] = (srcPos < size) ? (firmware.current.bytes[srcPos] & 0xFF) : 0x00;
         }
 
-        // compute CRC16 over first 2052 bytes
         const crcRez = computeCRC16(bufwr.subarray(0, 2052), 0);
         bufwr[2052] = (crcRez >> 8) & 0xFF;
         bufwr[2053] = crcRez & 0xFF;
@@ -106,112 +96,86 @@ export default function App() {
             return;
         }
         indexRef.current = 0;
-        setProgress("Start: sender loop");
-        startSenderLoop();
-        appendLog("Sender loop started. Waiting device responses...");
+        packetBufRef.current = [];
+        setProgress("Start: send boot command");
+        await sendNextBlock();
+        appendLog("Boot command sent. Waiting device response...");
     }
 
-    // New signalling refs for sender loop
-    const permissionResolveRef = useRef(null); // function to resolve waiting promise
-    const lastAckRef = useRef(null); // { ok: boolean, idx: number }
-    const senderRunningRef = useRef(false);
+    const isSendingRef = useRef(false);
 
-    function waitForPermission() {
-        return new Promise((resolve) => {
-            permissionResolveRef.current = resolve;
-        });
-    }
+    // App.jsx
+    async function sendNextBlock(delayMs = 0) {
+        if (isSendingRef.current) return;
+        isSendingRef.current = true;
 
-    // sendNextBlock now only sends current-index packet (does NOT increment index)
-    async function sendNextBlock() {
+        // Минимальная пауза 60 мс гарантирует, что МК успел записать Flash
+        // и полностью готов слушать следующий каскад USB-прерываний.
+        const waitTime = Math.max(delayMs, 60);
+        await new Promise(r => setTimeout(r, waitTime));
+
         const idx = indexRef.current;
         if (idx >= firmware.current.blocks) {
-            setProgress("All blocks sent");
-            appendLog("All blocks sent.");
+            setProgress("All blocks sent successfully!");
+            appendLog("All blocks sent successfully!");
+            isSendingRef.current = false;
             return;
         }
+
         setProgress(`Sending block ${idx} / ${firmware.current.blocks - 1}`);
         const p = buildFWPacket(idx);
-        await sendBytes(p);
-    }
-
-    // Sender loop: sends current block, waits for device confirmation (via handleIncoming),
-    // then increments index or retries based on device response.
-    async function startSenderLoop() {
-        if (senderRunningRef.current) return;
-        senderRunningRef.current = true;
 
         try {
-            while (indexRef.current < firmware.current.blocks) {
-                // Send current block
-                await sendNextBlock();
-
-                // Wait for device confirmation (handleIncoming will resolve)
-                await waitForPermission();
-
-                const ack = lastAckRef.current;
-                lastAckRef.current = null;
-                permissionResolveRef.current = null;
-
-                if (ack && ack.ok === true && ack.idx === indexRef.current) {
-                    appendLog(`Device confirmed block ${ack.idx}. Advancing to next block.`);
-                    indexRef.current++;
-                } else if (ack && ack.ok === false) {
-                    appendLog(`Device reported error for block ${indexRef.current}. Retrying...`);
-                    // retry the same index (loop continues)
-                } else {
-                    appendLog("No valid ack received, retrying current block.");
-                    // conservative retry
-                }
-            }
-
-            setProgress("All blocks sent");
-            appendLog("All blocks sent (sender loop finished).");
+            packetBufRef.current = []; // Очищаем локальный приемник ответов
+            await serial.current.sendFWPacket(p);
         } catch (e) {
-            appendLog("Sender loop error: " + e);
+            appendLog("Send FW packet error: " + e);
         } finally {
-            senderRunningRef.current = false;
+            isSendingRef.current = false;
         }
     }
 
-    // Incoming data handler: accumulate simple parsing and signal sender loop instead of sending directly
-    const packetBufRef = useRef([]);
     async function handleIncoming(chunk) {
         const bytes = Array.from(chunk);
         packetBufRef.current.push(...bytes);
 
-        appendLog("RX: " + bytes.map(b => b.toString(16).padStart(2, '0')).join(" "));
-
-        const PACKET_SIZE = 5; // adjust if real incoming packet differs
-
-        while (packetBufRef.current.length >= PACKET_SIZE) {
-            // find header 0x55
+        while (packetBufRef.current.length >= 3) {
             if (packetBufRef.current[0] !== 0x55) {
                 packetBufRef.current.shift();
                 continue;
             }
 
-            if (packetBufRef.current.length < PACKET_SIZE) break;
+            const payloadLen = packetBufRef.current[2];
+            const totalPacketLen = 3 + payloadLen + 1;
 
-            const packet = packetBufRef.current.splice(0, PACKET_SIZE);
-            const [header, code, len, idx] = packet;
+            if (packetBufRef.current.length < totalPacketLen) {
+                break;
+            }
 
-            // Instead of calling sendNextBlock from here, set ack info and resolve sender loop
-            if (code === 0x01 && idx === indexRef.current) {
-                lastAckRef.current = { ok: true, idx };
-                appendLog(`dev approves; index ${idx}`);
-                if (permissionResolveRef.current) permissionResolveRef.current();
-            } else if (idx === 0xFF || code === 0x00) {
-                lastAckRef.current = { ok: false, idx: indexRef.current };
-                appendLog(`dev error; repeat index ${indexRef.current}`);
-                if (permissionResolveRef.current) permissionResolveRef.current();
+            const packet = packetBufRef.current.splice(0, totalPacketLen);
+            const code = packet[1];
+            const len = packet[2];
+
+            if (len === 1) {
+                const idx = packet[3];
+
+                if (code === 0x01 && idx === indexRef.current) {
+                    indexRef.current++;
+                    appendLog(`Block ${idx} ACK -> next index ${indexRef.current}`);
+                    // Пауза перед отправкой следующего блока (передаст 60мс в sendNextBlock)
+                    await sendNextBlock(60);
+                }
+                else if (code === 0x00 && idx === 0xFF) {
+                    appendLog(`Block ${indexRef.current} NACK -> Flash busy. Waiting 350ms...`);
+                    // При NACK даем МК время окончить запись и восстановить CDC RX
+                    await sendNextBlock(350);
+                }
             } else {
-                appendLog(`Unknown packet: ${packet.map(b => b.toString(16).padStart(2, '0')).join(" ")}`);
+                appendLog(`Ignored long packet/echo (len=${len})`);
             }
         }
     }
 
-    // New: find STATUS.BIN in user-selected directory (uses File System Access API)
     async function findStatusBin() {
         if (!window.showDirectoryPicker) {
             appendLog("File System Access API not available in this environment");
@@ -235,7 +199,6 @@ export default function App() {
         }
     }
 
-    // write "UPDFW#" into STATUS.BIN preserving remaining bytes up to 2048
     async function writeUpdFw() {
         if (!statusFileHandleRef.current) {
             appendLog("No STATUS.BIN selected");
@@ -290,7 +253,7 @@ export default function App() {
                     return;
                 }
             } else {
-                appendLog("Save-As not available (no showSaveFilePicker). Consider running in Electron/Node for reliable writes.");
+                appendLog("Save-As not available (no showSaveFilePicker).");
             }
         } catch (e) {
             appendLog("Write error: " + e);
@@ -300,7 +263,6 @@ export default function App() {
     return (
         <div style={{ padding: 20, fontFamily: "Segoe UI, Arial" }}>
             <h2>Firmware Web Flasher</h2>
-
             <div style={{ marginBottom: 8 }}>
                 <button onClick={selectAndOpenPort}>Select & Open Port</button>{" "}
                 <button onClick={closePort}>Close Port</button>
@@ -313,25 +275,23 @@ export default function App() {
             </div>
 
             <div style={{ marginBottom: 8 }}>
-                <label>Firmware HEX: </label>
-                <input type="file" accept=".hex" onChange={handleFile} />
+                <input type="file" accept=".hex,.ihx" onChange={handleFile} />
                 <span style={{ marginLeft: 8 }}>{fileName}</span>
             </div>
 
             <div style={{ marginBottom: 8 }}>
-                <button onClick={startFlash}>Start Flash</button>{" "}
-                <button onClick={() => { indexRef.current = 0; appendLog("Index reset to 0"); }}>Reset Index</button>
+                <button onClick={startFlash}>Flash</button>
+                <span style={{ marginLeft: 12 }}>{progress}</span>
             </div>
 
             <div style={{ marginBottom: 8 }}>
-                <button onClick={findStatusBin}>Select STATUS.BIN Directory</button>{" "}
-                <button onClick={writeUpdFw}>Write UPDFW# to STATUS.BIN</button>
-                <span style={{ marginLeft: 8 }}>{statusFileName}</span>
+                <button onClick={findStatusBin}>Find STATUS.BIN</button>{" "}
+                <button onClick={writeUpdFw}>Write UPDFW#</button>
+                <span style={{ marginLeft: 12 }}>{statusFileName}</span>
             </div>
 
             <div style={{ marginTop: 12 }}>
-                <div><strong>Progress:</strong> {progress}</div>
-                <textarea readOnly value={log} rows={12} style={{ width: "100%", marginTop: 8 }} />
+                <textarea readOnly value={log} rows={12} cols={80} />
             </div>
         </div>
     );

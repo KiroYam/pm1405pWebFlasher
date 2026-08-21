@@ -1,9 +1,10 @@
+// services/webSerial.js
 export class WebSerialPort {
     constructor() {
         this.port = null;
         this.reader = null;
         this.writer = null;
-        this.onData = null; // callback Uint8Array -> void
+        this.onData = null;
     }
 
     async requestPort() {
@@ -13,11 +14,17 @@ export class WebSerialPort {
 
     async open(baudRate = 115200) {
         if (!this.port) throw new Error("No port selected");
+
         await this.port.open({
             baudRate,
-            bufferSize: 25536,
-            flowControl: "none" // Явно отключаем аппаратный/программный Flow Control
+            dataBits: 8,
+            parity: "none",
+            stopBits: 1,
+            bufferSize: 8192,
+            flowControl: "none"
         });
+
+        await new Promise(r => setTimeout(r, 30));
         this.writer = this.port.writable.getWriter();
         this.readLoop();
     }
@@ -25,14 +32,17 @@ export class WebSerialPort {
     async close() {
         try {
             if (this.reader) {
-                await this.reader.cancel();
-                this.reader.releaseLock();
+                try { await this.reader.cancel(); } catch { }
+                try { this.reader.releaseLock(); } catch { }
                 this.reader = null;
             }
+
             if (this.writer) {
-                this.writer.releaseLock();
+                try { await this.writer.close(); } catch { }
+                try { this.writer.releaseLock(); } catch { }
                 this.writer = null;
             }
+
             if (this.port) {
                 await this.port.close();
                 this.port = null;
@@ -42,12 +52,22 @@ export class WebSerialPort {
         }
     }
 
-    async writeBytes(bytes) {
-        if (!this.writer) throw new Error("Port not open");
-        await this.writer.write(new Uint8Array(bytes));
+    /**
+     * Отправка кадра 2054 байт единой транзакцией
+     * @param {Uint8Array} buffer - Массив байт длиной 2054
+     */
+    async sendFWPacket(buffer) {
+        if (!this.port || !this.port.writable || !this.writer) {
+            throw new Error("Port or writer not ready");
+        }
+
+        // Передаем весь массив монолитно. Драйвер ОС сам нарезает его
+        // на 64-байтные USB FS транзакции с точным соблюдением границ.
+        await this.writer.write(buffer);
     }
 
     async readLoop() {
+        if (!this.port || !this.port.readable) return;
         this.reader = this.port.readable.getReader();
         try {
             while (true) {
