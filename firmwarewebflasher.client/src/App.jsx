@@ -24,15 +24,13 @@ export default function App() {
 
     const [log, setLog] = useState("");
     const [progress, setProgress] = useState("");
-    const [devAddr, setDevAddr] = useState("01");
+
     const [portState, setPortState] = useState("closed");
     
 
     const statusFileHandleRef = useRef(null);
     const statusFileContentRef = useRef(null);
 
-    // initialize fileName from embedded asset to avoid setState() inside effect
-    const [fileName, setFileName] = useState(pmHex ? "PM1405P.hex" : "");
     const [statusFileName, setStatusFileName] = useState("");
 
     function appendLog(s) {
@@ -76,22 +74,6 @@ export default function App() {
             setTimeout(() => appendLog("HEX parse error: " + err), 0);
         }
     }, []);
-
-    async function handleFile(e) {
-        const f = e?.target?.files?.[0];
-        if (!f) return;
-        setFileName(f.name);
-        try {
-            const text = await f.text();
-            const { bytes, blocks } = parseIntelHex(text);
-            firmware.current.bytes = bytes;
-            firmware.current.blocks = blocks;
-            appendLog(`Parsed ${bytes.length} bytes, ${blocks} blocks`);
-        } catch (err) {
-            appendLog("HEX parse error: " + err);
-        }
-    }
-   
 
     function buildFWPacket(index) {
         const size = firmware.current.bytes.length;
@@ -209,7 +191,7 @@ export default function App() {
             try {
                 // send without checking isSendingRef to allow retransmit
                 await serial.current.sendFWPacket(p);
-                appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
+               // appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
             } catch (e) {
                 appendLog("Resend error: " + e);
             } finally {
@@ -223,7 +205,7 @@ export default function App() {
             try {
                 // send without checking isSendingRef to allow retransmit
                 await serial.current.sendFWPacket(p);
-                appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
+               // appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
             } catch (e) {
                 appendLog("Resend error: " + e);
             } finally {
@@ -260,7 +242,7 @@ export default function App() {
                 lastSendTimeRef.current = Date.now();
                 appendLog(`Sending block ${idx} (sent at ${new Date(lastSendTimeRef.current).toISOString()})`);
                 await serial.current.sendFWPacket(p);
-                appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
+               // appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
                 // запустить таймаут ожидания ответа
                 scheduleResponseTimeout();
             } catch (e) {
@@ -278,7 +260,7 @@ export default function App() {
                 lastSendTimeRef.current = Date.now();
                 appendLog(`Sending block ${idx} (sent at ${new Date(lastSendTimeRef.current).toISOString()})`);
                 await serial.current.sendFWPacket(p);
-                appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
+                //appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
                 // запустить таймаут ожидания ответа
                 //scheduleResponseTimeout();
             } catch (e) {
@@ -403,7 +385,7 @@ export default function App() {
                 appendLog("Wrote UPDFW# to STATUS.BIN (2048 bytes) successfully");
                 return;
             } catch (err) {
-                appendLog("Primary write failed: " + err);
+                //appendLog("Primary write failed: " + err);
                 if (!(err && err.name === "QuotaExceededError")) throw err;
             }
 
@@ -421,7 +403,7 @@ export default function App() {
                     setStatusFileName("Saved via Save-As");
                     return;
                 } catch (saveErr) {
-                    appendLog("Save-As failed: " + saveErr);
+                    //appendLog("Save-As failed: " + saveErr);
                     return;
                 }
             } else {
@@ -430,100 +412,30 @@ export default function App() {
         } catch (e) {
             appendLog("Write error: " + e);
         }
-    }
-
-    async function writeUpdFw() {
-        if (!statusFileHandleRef.current) {
-            appendLog("No STATUS.BIN selected");
-            return;
-        }
-        try {
-            const file = await statusFileHandleRef.current.getFile();
-            const original = new Uint8Array(await file.arrayBuffer());
-            appendLog(`Original STATUS.BIN size: ${original.length}`);
-
-            const encoder = new TextEncoder();
-            const cmd = "UPDFW#\r\n";
-            const cmdBytes = encoder.encode(cmd);
-            const pos = cmdBytes.length;
-            const TARGET = 2048;
-
-            const out = new Uint8Array(TARGET);
-            out.set(cmdBytes.subarray(0, Math.min(cmdBytes.length, TARGET)), 0);
-            for (let i = pos; i < TARGET; i++) {
-                out[i] = i < original.length ? original[i] : 0x00;
-            }
-
-            try {
-                const writable = await statusFileHandleRef.current.createWritable();
-                await writable.write(out);
-                if (typeof writable.truncate === "function") {
-                    await writable.truncate(TARGET);
-                }
-                await writable.close();
-                appendLog("Wrote UPDFW# to STATUS.BIN (2048 bytes) successfully");
-                return;
-            } catch (err) {
-                appendLog("Primary write failed: " + err);
-                if (!(err && err.name === "QuotaExceededError")) throw err;
-            }
-
-            if (typeof window.showSaveFilePicker === "function") {
-                try {
-                    const saveHandle = await window.showSaveFilePicker({
-                        suggestedName: "STATUS.BIN",
-                        types: [{ description: "Binary", accept: { "application/octet-stream": [".bin"] } }]
-                    });
-                    const w2 = await saveHandle.createWritable();
-                    await w2.write(out);
-                    await w2.close();
-                    appendLog("Saved STATUS.BIN via Save-As (2048 bytes)");
-                    statusFileHandleRef.current = saveHandle;
-                    setStatusFileName("Saved via Save-As");
-                    return;
-                } catch (saveErr) {
-                    appendLog("Save-As failed: " + saveErr);
-                    return;
-                }
-            } else {
-                appendLog("Save-As not available (no showSaveFilePicker).");
-            }
-        } catch (e) {
-            appendLog("Write error: " + e);
-        }
-    }
-
-    
+    }    
 
     return (
         <div style={{ padding: 20, fontFamily: "Segoe UI, Arial" }}>
-            <h2>Firmware Web Flasher</h2>
+            <h1>Firmware Web Flasher</h1>
+            <h2>1. Switching to boot mode</h2>     
+            <h2>Connect PM1405P to the PC</h2>     
+            <div style={{ marginBottom: 8 }}>
+                <button onClick={findStatusBin}>Find "1405P INFO" & Allow writing to the STATUS.BIN</button>{" "}
+                <span style={{ marginLeft: 12 }}>{statusFileName}</span>
+            </div>
+            <h2>2. Open Port PM1405P</h2>
             <div style={{ marginBottom: 8 }}>
                 <button onClick={selectAndOpenPort}>Select & Open Port</button>{" "}
                 <button onClick={closePort}>Close Port</button>
                 <span style={{ marginLeft: 12 }}>Port: {portState}</span>
             </div>
-
-            <div style={{ marginBottom: 8 }}>
-                <label>DevAddr (hex): </label>
-                <input value={devAddr} onChange={e => setDevAddr(e.target.value)} style={{ width: 60 }} />
-            </div>
-
-            <div style={{ marginBottom: 8 }}>
-                <input type="file" accept=".hex,.ihx" onChange={handleFile} />
-                <span style={{ marginLeft: 8 }}>{fileName}</span>
-            </div>
-
+            <h2>3.Flash firmware</h2>
             <div style={{ marginBottom: 8 }}>
                 <button onClick={startFlash}>Flash</button>                
                 <span style={{ marginLeft: 12 }}>{progress}</span>
             </div>
 
-            <div style={{ marginBottom: 8 }}>
-                <button onClick={findStatusBin}>Find&Write STATUS.BIN</button>{" "}
-                <button onClick={writeUpdFw}>Write UPDFW#</button>
-                <span style={{ marginLeft: 12 }}>{statusFileName}</span>
-            </div>
+           
 
             <div style={{ marginTop: 12 }}>
                 <textarea readOnly value={log} rows={12} cols={80} />
