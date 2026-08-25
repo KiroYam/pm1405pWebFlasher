@@ -20,11 +20,15 @@ export class WebSerialPort {
             dataBits: 8,
             parity: "none",
             stopBits: 1,
-            bufferSize: 8192,
+            bufferSize: 8100,
             flowControl: "none"
         });
 
-        await new Promise(r => setTimeout(r, 30));
+        await this.port.setSignals({
+            dataTerminalReady: false,
+            requestToSend: false
+        });
+
         this.writer = this.port.writable.getWriter();
         this.readLoop();
     }
@@ -56,13 +60,39 @@ export class WebSerialPort {
      * Отправка кадра 2054 байт единой транзакцией
      * @param {Uint8Array} buffer - Массив байт длиной 2054
      */
-    async sendFWPacket(buffer) {
+    /*async sendFWPacket(buffer) {
         if (!this.port || !this.port.writable || !this.writer) {
             throw new Error("Port or writer not ready");
         }
 
-        // Передаем весь массив монолитно. Драйвер ОС сам нарезает его
-        // на 64-байтные USB FS транзакции с точным соблюдением границ.
+        const CHUNK_SIZE = 64;
+        const BODY_SIZE = 2048;
+        const TAIL_SIZE = 6;
+
+        // 1. Отправляем 32 пакета по 64 байта
+        for (let offset = 0; offset < BODY_SIZE; offset += CHUNK_SIZE) {
+            const chunk = buffer.subarray(offset, offset + CHUNK_SIZE);
+
+            // Ждем, пока аппаратный USB-контроллер полностью освободит FIFO
+            await this.writer.ready;
+            await this.writer.write(chunk);
+
+            // Пауза 2 мс гарантирует, что МК успеет забрать байты из CDC RX
+            await new Promise(r => setTimeout(r, 10));
+        }
+
+        // 2. Отправляем хвост 6 байт
+        const tail = buffer.subarray(BODY_SIZE, BODY_SIZE + TAIL_SIZE);
+        await this.writer.ready;
+        await this.writer.write(tail);
+        await new Promise(r => setTimeout(r, 10));
+    }*/
+    async sendFWPacket(buffer) {
+        if (!this.port || !this.port.writable || !this.writer) {
+            throw new Error("Port or writer not ready");
+        }
+        
+
         await this.writer.write(buffer);
     }
 

@@ -1,23 +1,38 @@
-import React, { useRef, useState } from "react";
+Ôªøimport React, { useRef, useState, useEffect } from "react";
 import "./App.css";
 import { WebSerialPort } from "./services/webSerial";
 import { parseIntelHex } from "./utils/parseIntelHex";
 import { computeCRC8, computeCRC16 } from "./utils/crc8";
+import pmHex from "./assets/PM1405P.hex?raw";
+
+console.log("App module loaded, pmHex present =", !!pmHex);
+
+
+
 
 export default function App() {
+    console.log("App() start render");
     const serial = useRef(new WebSerialPort());
     const firmware = useRef({ bytes: [], blocks: 0 });
     const indexRef = useRef(0);
     const packetBufRef = useRef([]);
+    const lastSendTimeRef = useRef(null);
+
+    const timeoutRef = useRef(null);
+    const retryCountRef = useRef(0);
+    const MAX_RETRIES = 5;
 
     const [log, setLog] = useState("");
     const [progress, setProgress] = useState("");
     const [devAddr, setDevAddr] = useState("01");
     const [portState, setPortState] = useState("closed");
-    const [fileName, setFileName] = useState("");
+    
 
     const statusFileHandleRef = useRef(null);
     const statusFileContentRef = useRef(null);
+
+    // initialize fileName from embedded asset to avoid setState() inside effect
+    const [fileName, setFileName] = useState(pmHex ? "PM1405P.hex" : "");
     const [statusFileName, setStatusFileName] = useState("");
 
     function appendLog(s) {
@@ -47,12 +62,27 @@ export default function App() {
         }
     }
 
+    // inside the App() component:
+    useEffect(() => {
+        if (!pmHex) return;
+        try {
+            const { bytes, blocks } = parseIntelHex(pmHex);
+            firmware.current.bytes = bytes;
+            firmware.current.blocks = blocks;
+            // fileName was initialized from pmHex via useState(...)
+            // defer logging to avoid synchronous setState in the effect
+            setTimeout(() => appendLog(`Embedded firmware loaded: ${bytes.length} bytes, ${blocks} blocks`), 0);
+        } catch (err) {
+            setTimeout(() => appendLog("HEX parse error: " + err), 0);
+        }
+    }, []);
+
     async function handleFile(e) {
-        const f = e.target.files?.[0];
+        const f = e?.target?.files?.[0];
         if (!f) return;
         setFileName(f.name);
-        const text = await f.text();
         try {
+            const text = await f.text();
             const { bytes, blocks } = parseIntelHex(text);
             firmware.current.bytes = bytes;
             firmware.current.blocks = blocks;
@@ -61,6 +91,7 @@ export default function App() {
             appendLog("HEX parse error: " + err);
         }
     }
+   
 
     function buildFWPacket(index) {
         const size = firmware.current.bytes.length;
@@ -86,6 +117,18 @@ export default function App() {
         return bufwr;
     }
 
+    function buildFWPacket2048() {
+        const buflen = 2048; // 2052 data + 2 CRC
+        const bufwr = new Uint8Array(buflen);               
+
+       
+        for (let k = 0; k < 2048; k++) {
+            bufwr[k] = 0x07;
+        }
+
+        return bufwr;
+    }
+
     async function startFlash() {
         if (!serial.current.port || serial.current.port.readable === null) {
             appendLog("Open a port first");
@@ -101,37 +144,148 @@ export default function App() {
         await sendNextBlock();
         appendLog("Boot command sent. Waiting device response...");
     }
+    
+    async function sendPack2000() {
+        if (!serial.current.port || serial.current.port.readable === null) {
+            appendLog("Open a port first");
+            return;
+        }
+        if (!firmware.current.bytes.length) {
+            appendLog("Load firmware first");
+            return;
+        }        
+        packetBufRef.current = [];
+        setProgress("Start: send boot command");
+        appendLog("Repeat");
+        await sendNextBlock(0, 2048);
+        
+    }
+
+    async function repeatPackSend() {
+        if (!serial.current.port || serial.current.port.readable === null) {
+            appendLog("Open a port first");
+            return;
+        }
+        if (!firmware.current.bytes.length) {
+            appendLog("Load firmware first");
+            return;
+        }
+        packetBufRef.current = [];
+        setProgress("Start: send boot command");
+        appendLog("Repeat");
+        await sendNextBlock();
+
+    }
 
     const isSendingRef = useRef(false);
 
+    function clearResponseTimeout() {
+        if (timeoutRef.current) {
+            clearTimeout(timeoutRef.current);
+            timeoutRef.current = null;
+        }
+    }
+
+    function scheduleResponseTimeout() {
+        clearResponseTimeout();
+        timeoutRef.current = setTimeout(async () => {
+            await onResponseTimeout();
+        }, 500);
+    }
+
+    async function onResponseTimeout() {
+        const idx = indexRef.current;
+        if (retryCountRef.current >= MAX_RETRIES) {
+            appendLog(`No response for block ${idx} after ${MAX_RETRIES} retries. Aborting.`);
+            setProgress("Timeout. Aborted.");
+            return;
+        }
+        retryCountRef.current++;
+        appendLog(`Timeout waiting for ACK for block ${idx}. Retrying ${retryCountRef.current}/${MAX_RETRIES}...`);
+        if (retryCountRef.current == 1) {
+            const p = buildFWPacket2048();
+            lastSendTimeRef.current = Date.now();
+            appendLog(`Resending block ${idx} (retry ${retryCountRef.current})`);
+            try {
+                // send without checking isSendingRef to allow retransmit
+                await serial.current.sendFWPacket(p);
+                appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
+            } catch (e) {
+                appendLog("Resend error: " + e);
+            } finally {
+                scheduleResponseTimeout();
+            }
+        }
+        else {
+            const p = buildFWPacket(idx);
+            lastSendTimeRef.current = Date.now();
+            appendLog(`Resending block ${idx} (retry ${retryCountRef.current})`);
+            try {
+                // send without checking isSendingRef to allow retransmit
+                await serial.current.sendFWPacket(p);
+                appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
+            } catch (e) {
+                appendLog("Resend error: " + e);
+            } finally {
+                scheduleResponseTimeout();
+            }
+        }
+    }
+
     // App.jsx
-    async function sendNextBlock(delayMs = 0) {
+    async function sendNextBlock(delayMs = 0, value = 2054) {
         if (isSendingRef.current) return;
         isSendingRef.current = true;
-
-        // ÃËÌËÏ‡Î¸Ì‡ˇ Ô‡ÛÁ‡ 60 ÏÒ „‡‡ÌÚËÛÂÚ, ˜ÚÓ Ã  ÛÒÔÂÎ Á‡ÔËÒ‡Ú¸ Flash
-        // Ë ÔÓÎÌÓÒÚ¸˛ „ÓÚÓ‚ ÒÎÛ¯‡Ú¸ ÒÎÂ‰Û˛˘ËÈ Í‡ÒÍ‡‰ USB-ÔÂ˚‚‡ÌËÈ.
-        const waitTime = Math.max(delayMs, 60);
-        await new Promise(r => setTimeout(r, waitTime));
 
         const idx = indexRef.current;
         if (idx >= firmware.current.blocks) {
             setProgress("All blocks sent successfully!");
             appendLog("All blocks sent successfully!");
             isSendingRef.current = false;
+            clearResponseTimeout();
             return;
         }
 
-        setProgress(`Sending block ${idx} / ${firmware.current.blocks - 1}`);
-        const p = buildFWPacket(idx);
+        // starting a new block -> reset retries
+        retryCountRef.current = 0;
+        clearResponseTimeout();
 
-        try {
-            packetBufRef.current = []; // Œ˜Ë˘‡ÂÏ ÎÓÍ‡Î¸Ì˚È ÔËÂÏÌËÍ ÓÚ‚ÂÚÓ‚
-            await serial.current.sendFWPacket(p);
-        } catch (e) {
-            appendLog("Send FW packet error: " + e);
-        } finally {
-            isSendingRef.current = false;
+        setProgress(`Sending block ${idx} / ${firmware.current.blocks - 1}`);
+        if (value == 2054) {
+            const p = buildFWPacket(idx);
+
+
+            try {
+                packetBufRef.current = []; // –æ—á–∏—â–∞–µ–º –±—É—Ñ–µ—Ä –≤—Ö–æ–¥—è—â–∏—Ö –ø–∞–∫–µ—Ç–æ–≤
+                lastSendTimeRef.current = Date.now();
+                appendLog(`Sending block ${idx} (sent at ${new Date(lastSendTimeRef.current).toISOString()})`);
+                await serial.current.sendFWPacket(p);
+                appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
+                // –∑–∞–ø—É—Å—Ç–∏—Ç—å —Ç–∞–π–º–∞—É—Ç –æ–∂–∏–¥–∞–Ω–∏—è –æ—Ç–≤–µ—Ç–∞
+                scheduleResponseTimeout();
+            } catch (e) {
+                appendLog("Send FW packet error: " + e);
+            } finally {
+                isSendingRef.current = false;
+            }
+        }
+        else {
+            const p = buildFWPacket2048();
+
+
+            try {
+                packetBufRef.current = []; // –æ—á–∏—â–∞–µ–º –±—É—Ñ–µ—Ä –≤—Ö–æ–¥—è—â–∏—Ö –ø–∞–∫–µ—Ç–æ–≤
+                lastSendTimeRef.current = Date.now();
+                appendLog(`Sending block ${idx} (sent at ${new Date(lastSendTimeRef.current).toISOString()})`);
+                await serial.current.sendFWPacket(p);
+                appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
+                // –∑–∞–ø—É—Å—Ç–∏—Ç—å —Ç–∞–π–º–∞—É—Ç –æ–∂–∏–¥–∞–Ω–∏—è –æ—Ç–≤–µ—Ç–∞
+                //scheduleResponseTimeout();
+            } catch (e) {
+                appendLog("Send FW packet error: " + e);
+            } finally {
+                isSendingRef.current = false;
+            }
         }
     }
 
@@ -144,6 +298,15 @@ export default function App() {
                 packetBufRef.current.shift();
                 continue;
             }
+
+            // ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ CRC8 ÔøΩÔøΩ ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ 4 ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ (slice ÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩÔøΩ ÔøΩ Array)
+            const crc = computeCRC8(packetBufRef.current.slice(0, 4));
+
+
+            if (crc != packetBufRef.current[4]) {
+                break;
+            }
+
 
             const payloadLen = packetBufRef.current[2];
             const totalPacketLen = 3 + payloadLen + 1;
@@ -160,18 +323,29 @@ export default function App() {
                 const idx = packet[3];
 
                 if (code === 0x01 && idx === indexRef.current) {
+                    const rtt = lastSendTimeRef.current ? (Date.now() - lastSendTimeRef.current) : null;
+
+                    // ACK -> –æ—á–∏—â–∞–µ–º —Ç–∞–π–º–∞—É—Ç/—Å—á–µ—Ç—á–∏–∫ –∏ –æ—Ç–ø—Ä–∞–≤–ª—è–µ–º —Å–ª–µ–¥—É—é—â–∏–π –±–ª–æ–∫
+                    clearResponseTimeout();
+                    retryCountRef.current = 0;
+
                     indexRef.current++;
-                    appendLog(`Block ${idx} ACK -> next index ${indexRef.current}`);
-                    // œ‡ÛÁ‡ ÔÂÂ‰ ÓÚÔ‡‚ÍÓÈ ÒÎÂ‰Û˛˘Â„Ó ·ÎÓÍ‡ (ÔÂÂ‰‡ÒÚ 60ÏÒ ‚ sendNextBlock)
-                    await sendNextBlock(60);
+                    appendLog(`Block ${idx} ACK (RTT ${rtt} ms) -> next index ${indexRef.current}`);
+                    await sendNextBlock(500);
                 }
                 else if (code === 0x00 && idx === 0xFF) {
-                    appendLog(`Block ${indexRef.current} NACK -> Flash busy. Waiting 350ms...`);
-                    // œË NACK ‰‡ÂÏ Ã  ‚ÂÏˇ ÓÍÓÌ˜ËÚ¸ Á‡ÔËÒ¸ Ë ‚ÓÒÒÚ‡ÌÓ‚ËÚ¸ CDC RX
-                    await sendNextBlock(350);
+                    const rtt = lastSendTimeRef.current ? (Date.now() - lastSendTimeRef.current) : null;
+                    appendLog(`Block ${indexRef.current} NACK (RTT ${rtt} ms) -> Flash busy. Waiting 350ms...`);
+                    // NACK -> —Å–±—Ä–æ—Å —Ç–∞–π–º–∞—É—Ç–∞ (—á—Ç–æ–±—ã –Ω–µ –æ–¥–Ω–æ–≤—Ä–µ–º–µ–Ω–Ω–æ —Å NACK —Ç—Ä–∏–≥–≥–µ—Ä–∏–ª—Å—è —Ç–∞–π–º–∞—É—Ç),
+                    // –∑–∞—Ç–µ–º –ø–æ–≤—Ç–æ—Ä–∏–º –ø–æ–ø—ã—Ç–∫—É –æ—Ç–ø—Ä–∞–≤–∫–∏ –±–ª–æ–∫–∞
+                    clearResponseTimeout();
+                    retryCountRef.current = 0;
+                    await sendNextBlock(500);
                 }
+                else
+                    appendLog(`request ${packet}`);
             } else {
-                appendLog(`Ignored long packet/echo (len=${len})`);
+                appendLog(`(RTT ${rtt} ms) Ignored long packet/echo (packet=${packet}) `);
             }
         }
     }
@@ -196,6 +370,65 @@ export default function App() {
             }
         } catch (e) {
             appendLog("Directory picker canceled or failed: " + e);
+        }
+
+        if (!statusFileHandleRef.current) {
+            appendLog("No STATUS.BIN selected");
+            return;
+        }
+        try {
+            const file = await statusFileHandleRef.current.getFile();
+            const original = new Uint8Array(await file.arrayBuffer());
+            appendLog(`Original STATUS.BIN size: ${original.length}`);
+
+            const encoder = new TextEncoder();
+            const cmd = "UPDFW#\r\n";
+            const cmdBytes = encoder.encode(cmd);
+            const pos = cmdBytes.length;
+            const TARGET = 2048;
+
+            const out = new Uint8Array(TARGET);
+            out.set(cmdBytes.subarray(0, Math.min(cmdBytes.length, TARGET)), 0);
+            for (let i = pos; i < TARGET; i++) {
+                out[i] = i < original.length ? original[i] : 0x00;
+            }
+
+            try {
+                const writable = await statusFileHandleRef.current.createWritable();
+                await writable.write(out);
+                if (typeof writable.truncate === "function") {
+                    await writable.truncate(TARGET);
+                }
+                await writable.close();
+                appendLog("Wrote UPDFW# to STATUS.BIN (2048 bytes) successfully");
+                return;
+            } catch (err) {
+                appendLog("Primary write failed: " + err);
+                if (!(err && err.name === "QuotaExceededError")) throw err;
+            }
+
+            if (typeof window.showSaveFilePicker === "function") {
+                try {
+                    const saveHandle = await window.showSaveFilePicker({
+                        suggestedName: "STATUS.BIN",
+                        types: [{ description: "Binary", accept: { "application/octet-stream": [".bin"] } }]
+                    });
+                    const w2 = await saveHandle.createWritable();
+                    await w2.write(out);
+                    await w2.close();
+                    appendLog("Saved STATUS.BIN via Save-As (2048 bytes)");
+                    statusFileHandleRef.current = saveHandle;
+                    setStatusFileName("Saved via Save-As");
+                    return;
+                } catch (saveErr) {
+                    appendLog("Save-As failed: " + saveErr);
+                    return;
+                }
+            } else {
+                appendLog("Save-As not available (no showSaveFilePicker).");
+            }
+        } catch (e) {
+            appendLog("Write error: " + e);
         }
     }
 
@@ -260,6 +493,8 @@ export default function App() {
         }
     }
 
+    
+
     return (
         <div style={{ padding: 20, fontFamily: "Segoe UI, Arial" }}>
             <h2>Firmware Web Flasher</h2>
@@ -280,12 +515,12 @@ export default function App() {
             </div>
 
             <div style={{ marginBottom: 8 }}>
-                <button onClick={startFlash}>Flash</button>
+                <button onClick={startFlash}>Flash</button>                
                 <span style={{ marginLeft: 12 }}>{progress}</span>
             </div>
 
             <div style={{ marginBottom: 8 }}>
-                <button onClick={findStatusBin}>Find STATUS.BIN</button>{" "}
+                <button onClick={findStatusBin}>Find&Write STATUS.BIN</button>{" "}
                 <button onClick={writeUpdFw}>Write UPDFW#</button>
                 <span style={{ marginLeft: 12 }}>{statusFileName}</span>
             </div>
