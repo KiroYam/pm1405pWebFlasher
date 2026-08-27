@@ -3,7 +3,7 @@ import "./App.css";
 import { WebSerialPort } from "./services/webSerial";
 import { parseIntelHex } from "./utils/parseIntelHex";
 import { computeCRC8, computeCRC16 } from "./utils/crc8";
-import pmHex from "./assets/PM1405P.hex?raw";
+import pmHex from "./assets/firmware.hex?raw";
 
 console.log("App module loaded, pmHex present =", !!pmHex);
 
@@ -69,7 +69,8 @@ export default function App() {
             firmware.current.blocks = blocks;
             // fileName was initialized from pmHex via useState(...)
             // defer logging to avoid synchronous setState in the effect
-            setTimeout(() => appendLog(`Embedded firmware loaded: ${bytes.length} bytes, ${blocks} blocks`), 0);
+            //setTimeout(() => appendLog(`Embedded firmware loaded: ${bytes.length} bytes, ${blocks} blocks`), 0);
+            setTimeout(() => appendLog(`Embedded firmware ready`), 0);
         } catch (err) {
             setTimeout(() => appendLog("HEX parse error: " + err), 0);
         }
@@ -124,7 +125,7 @@ export default function App() {
         packetBufRef.current = [];
         setProgress("Start: send boot command");
         await sendNextBlock();
-        appendLog("Boot command sent. Waiting device response...");
+        appendLog("Flashing is started");
     }
     
     async function sendPack2000() {
@@ -178,16 +179,21 @@ export default function App() {
     async function onResponseTimeout() {
         const idx = indexRef.current;
         if (retryCountRef.current >= MAX_RETRIES) {
+            if (indexRef.current == 127) {
+                setProgress("All blocks sent successfully!");
+                appendLog("All blocks sent successfully!");
+                return;
+            }
             appendLog(`No response for block ${idx} after ${MAX_RETRIES} retries. Aborting.`);
             setProgress("Timeout. Aborted.");
             return;
         }
         retryCountRef.current++;
-        appendLog(`Timeout waiting for ACK for block ${idx}. Retrying ${retryCountRef.current}/${MAX_RETRIES}...`);
+        //appendLog(`Timeout waiting for ACK for block ${idx}. Retrying ${retryCountRef.current}/${MAX_RETRIES}...`);
         if (retryCountRef.current == 1) {
             const p = buildFWPacket2048();
             lastSendTimeRef.current = Date.now();
-            appendLog(`Resending block ${idx} (retry ${retryCountRef.current})`);
+            //appendLog(`Resending block ${idx} (retry ${retryCountRef.current})`);
             try {
                 // send without checking isSendingRef to allow retransmit
                 await serial.current.sendFWPacket(p);
@@ -201,13 +207,13 @@ export default function App() {
         else {
             const p = buildFWPacket(idx);
             lastSendTimeRef.current = Date.now();
-            appendLog(`Resending block ${idx} (retry ${retryCountRef.current})`);
+            //appendLog(`Resending block ${idx} (retry ${retryCountRef.current})`);
             try {
                 // send without checking isSendingRef to allow retransmit
                 await serial.current.sendFWPacket(p);
                // appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
             } catch (e) {
-                appendLog("Resend error: " + e);
+               // appendLog("Resend error: " + e);
             } finally {
                 scheduleResponseTimeout();
             }
@@ -240,13 +246,13 @@ export default function App() {
             try {
                 packetBufRef.current = []; // очищаем буфер входящих пакетов
                 lastSendTimeRef.current = Date.now();
-                appendLog(`Sending block ${idx} (sent at ${new Date(lastSendTimeRef.current).toISOString()})`);
+                //appendLog(`Sending block ${idx} (sent at ${new Date(lastSendTimeRef.current).toISOString()})`);
                 await serial.current.sendFWPacket(p);
                // appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
                 // запустить таймаут ожидания ответа
                 scheduleResponseTimeout();
             } catch (e) {
-                appendLog("Send FW packet error: " + e);
+               // appendLog("Send FW packet error: " + e);
             } finally {
                 isSendingRef.current = false;
             }
@@ -258,7 +264,7 @@ export default function App() {
             try {
                 packetBufRef.current = []; // очищаем буфер входящих пакетов
                 lastSendTimeRef.current = Date.now();
-                appendLog(`Sending block ${idx} (sent at ${new Date(lastSendTimeRef.current).toISOString()})`);
+               // appendLog(`Sending block ${idx} (sent at ${new Date(lastSendTimeRef.current).toISOString()})`);
                 await serial.current.sendFWPacket(p);
                 //appendLog("Sent: " + Array.from(p).map(b => b.toString(16).padStart(2, '0')).join(" "));
                 // запустить таймаут ожидания ответа
@@ -312,12 +318,12 @@ export default function App() {
                     retryCountRef.current = 0;
 
                     indexRef.current++;
-                    appendLog(`Block ${idx} ACK (RTT ${rtt} ms) -> next index ${indexRef.current}`);
+                   // appendLog(`Block ${idx} ACK (RTT ${rtt} ms) -> next index ${indexRef.current}`);
                     await sendNextBlock(500);
                 }
                 else if (code === 0x00 && idx === 0xFF) {
                     const rtt = lastSendTimeRef.current ? (Date.now() - lastSendTimeRef.current) : null;
-                    appendLog(`Block ${indexRef.current} NACK (RTT ${rtt} ms) -> Flash busy. Waiting 350ms...`);
+                    //appendLog(`Block ${indexRef.current} NACK (RTT ${rtt} ms) -> Flash busy. Waiting 350ms...`);
                     // NACK -> сброс таймаута (чтобы не одновременно с NACK триггерился таймаут),
                     // затем повторим попытку отправки блока
                     clearResponseTimeout();
@@ -416,7 +422,7 @@ export default function App() {
 
     return (
         <div style={{ padding: 20, fontFamily: "Segoe UI, Arial" }}>
-            <h1>Firmware Web Flasher</h1>
+            <h1>Firmware Web Flasher v.1.0.1</h1>
             <h2>1. Switching to boot mode</h2>     
             <h2>Connect PM1405P to the PC</h2>     
             <div style={{ marginBottom: 8 }}>
